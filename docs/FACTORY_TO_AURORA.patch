@@ -1,0 +1,868 @@
+--- a/main/boards/sp-esp32-s3-lcd-3.5-cam-ml307/aurora_max35_display.cc
++++ b/main/boards/sp-esp32-s3-lcd-3.5-cam-ml307/aurora_max35_display.cc
+@@ -0,0 +1,707 @@
++#include "aurora_max35_display.h"
++
++#include "application.h"
++#include "assets/lang_config.h"
++#include "board.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cstdio>
++#include <cstring>
++#include <ctime>
++
++#include <esp_log.h>
++#include <font_awesome.h>
++
++#define TAG "AuroraMAX35"
++
++LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
++LV_FONT_DECLARE(font_puhui_basic_30_4);
++LV_FONT_DECLARE(font_awesome_20_4);
++LV_FONT_DECLARE(font_awesome_30_4);
++
++namespace {
++constexpr uint32_t kBgTop = 0x07111F;
++constexpr uint32_t kBgBottom = 0x101B32;
++constexpr uint32_t kPanel = 0x101D2E;
++constexpr uint32_t kPanelRaised = 0x16273D;
++constexpr uint32_t kPanelSoft = 0x0D1727;
++constexpr uint32_t kInk = 0xF4F8FF;
++constexpr uint32_t kMuted = 0x8EA3B9;
++constexpr uint32_t kCyan = 0x62D8FF;
++constexpr uint32_t kViolet = 0x9C8CFF;
++constexpr uint32_t kGreen = 0x73E0B1;
++constexpr uint32_t kGold = 0xF1C46A;
++constexpr uint32_t kRed = 0xFF7D8C;
++constexpr uint32_t kBorder = 0x27415B;
++
++constexpr int64_t kReturnHomeDelayUs = 4200000LL;
++constexpr int64_t kAfterScrollDelayUs = 1800000LL;
++constexpr int64_t kScrollDebounceUs = 1300000LL;
++
++lv_obj_t* MakePanel(lv_obj_t* parent, int x, int y, int w, int h, uint32_t bg, int radius = 18) {
++    auto* obj = lv_obj_create(parent);
++    lv_obj_set_pos(obj, x, y);
++    lv_obj_set_size(obj, w, h);
++    lv_obj_set_style_radius(obj, radius, 0);
++    lv_obj_set_style_bg_color(obj, lv_color_hex(bg), 0);
++    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
++    lv_obj_set_style_border_color(obj, lv_color_hex(kBorder), 0);
++    lv_obj_set_style_border_width(obj, 1, 0);
++    lv_obj_set_style_pad_all(obj, 0, 0);
++    lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_OFF);
++    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
++    return obj;
++}
++
++lv_obj_t* MakeLabel(lv_obj_t* parent, const char* text, int x, int y, int w,
++                    uint32_t color, const lv_font_t* font = &BUILTIN_TEXT_FONT,
++                    lv_text_align_t align = LV_TEXT_ALIGN_LEFT) {
++    auto* label = lv_label_create(parent);
++    lv_label_set_text(label, text ? text : "");
++    lv_obj_set_pos(label, x, y);
++    lv_obj_set_width(label, w);
++    lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
++    lv_obj_set_style_text_font(label, font, 0);
++    lv_obj_set_style_text_align(label, align, 0);
++    return label;
++}
++
++void StyleRoot(lv_obj_t* root) {
++    lv_obj_set_pos(root, 0, 0);
++    lv_obj_set_size(root, 480, 320);
++    lv_obj_set_style_radius(root, 0, 0);
++    lv_obj_set_style_border_width(root, 0, 0);
++    lv_obj_set_style_pad_all(root, 0, 0);
++    lv_obj_set_style_bg_color(root, lv_color_hex(kBgTop), 0);
++    lv_obj_set_style_bg_grad_color(root, lv_color_hex(kBgBottom), 0);
++    lv_obj_set_style_bg_grad_dir(root, LV_GRAD_DIR_VER, 0);
++    lv_obj_set_scrollbar_mode(root, LV_SCROLLBAR_MODE_OFF);
++    lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
++}
++
++bool EndsWithAsciiWordChar(const std::string& text) {
++    if (text.empty()) return false;
++    unsigned char c = static_cast<unsigned char>(text.back());
++    return c < 0x80 && (std::isalnum(c) || c == ')' || c == ']' || c == '"');
++}
++
++bool StartsWithAsciiWordChar(const char* text) {
++    if (!text || !text[0]) return false;
++    unsigned char c = static_cast<unsigned char>(text[0]);
++    return c < 0x80 && (std::isalnum(c) || c == '(' || c == '[' || c == '"');
++}
++}  // namespace
++
++AuroraMax35Display::AuroraMax35Display(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
++                                       int width, int height, int offset_x, int offset_y,
++                                       bool mirror_x, bool mirror_y, bool swap_xy)
++    : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
++    BuildAuroraUi();
++
++    esp_timer_create_args_t timer_args = {
++        .callback = &AuroraMax35Display::NotificationTimerCallback,
++        .arg = this,
++        .dispatch_method = ESP_TIMER_TASK,
++        .name = "aurora_notice",
++        .skip_unhandled_events = true,
++    };
++    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &aurora_notification_timer_));
++    ESP_LOGI(TAG, "AURORA UI attached to SpotPear MAX35 factory 4G display");
++}
++
++AuroraMax35Display::~AuroraMax35Display() {
++    if (aurora_notification_timer_) {
++        esp_timer_stop(aurora_notification_timer_);
++        esp_timer_delete(aurora_notification_timer_);
++        aurora_notification_timer_ = nullptr;
++    }
++    aurora_preview_cache_.reset();
++    if (aurora_root_) {
++        DisplayLockGuard lock(this);
++        lv_obj_del(aurora_root_);
++        aurora_root_ = nullptr;
++    }
++}
++
++void AuroraMax35Display::HideFactoryUi() {
++    if (container_) lv_obj_add_flag(container_, LV_OBJ_FLAG_HIDDEN);
++    if (status_bar_) lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
++    if (emoji_label_) lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
++    if (emoji_image_) lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
++    if (emoji_box_) lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
++    if (preview_image_) lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
++}
++
++void AuroraMax35Display::BuildAuroraUi() {
++    DisplayLockGuard lock(this);
++    HideFactoryUi();
++
++    auto* screen = lv_screen_active();
++    lv_obj_set_style_bg_color(screen, lv_color_hex(kBgTop), 0);
++    lv_obj_set_style_text_font(screen, &BUILTIN_TEXT_FONT, 0);
++    lv_obj_set_style_text_color(screen, lv_color_hex(kInk), 0);
++
++    aurora_root_ = lv_obj_create(screen);
++    StyleRoot(aurora_root_);
++
++    // HOME ------------------------------------------------------------------
++    home_root_ = lv_obj_create(aurora_root_);
++    StyleRoot(home_root_);
++
++    home_brand_ = MakeLabel(home_root_, "AURORA  /  MAX35 · 4G", 18, 13, 260, kCyan);
++    lv_obj_set_style_text_letter_space(home_brand_, 1, 0);
++
++    home_clock_ = MakeLabel(home_root_, "--:--", 326, 10, 136, kInk, &font_puhui_basic_30_4, LV_TEXT_ALIGN_RIGHT);
++    home_date_ = MakeLabel(home_root_, "时间同步中", 300, 44, 162, kMuted, &BUILTIN_TEXT_FONT, LV_TEXT_ALIGN_RIGHT);
++
++    auto* divider = lv_obj_create(home_root_);
++    lv_obj_set_pos(divider, 18, 72);
++    lv_obj_set_size(divider, 444, 1);
++    lv_obj_set_style_border_width(divider, 0, 0);
++    lv_obj_set_style_bg_color(divider, lv_color_hex(kBorder), 0);
++    lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
++
++    home_core_outer_ = lv_obj_create(home_root_);
++    lv_obj_set_pos(home_core_outer_, 48, 98);
++    lv_obj_set_size(home_core_outer_, 136, 136);
++    lv_obj_set_style_radius(home_core_outer_, 68, 0);
++    lv_obj_set_style_bg_color(home_core_outer_, lv_color_hex(0x0C2034), 0);
++    lv_obj_set_style_bg_grad_color(home_core_outer_, lv_color_hex(0x24204B), 0);
++    lv_obj_set_style_bg_grad_dir(home_core_outer_, LV_GRAD_DIR_VER, 0);
++    lv_obj_set_style_border_color(home_core_outer_, lv_color_hex(kCyan), 0);
++    lv_obj_set_style_border_width(home_core_outer_, 2, 0);
++    lv_obj_set_style_shadow_color(home_core_outer_, lv_color_hex(kCyan), 0);
++    lv_obj_set_style_shadow_width(home_core_outer_, 22, 0);
++    lv_obj_set_style_shadow_opa(home_core_outer_, LV_OPA_20, 0);
++    lv_obj_set_style_pad_all(home_core_outer_, 0, 0);
++    lv_obj_remove_flag(home_core_outer_, LV_OBJ_FLAG_SCROLLABLE);
++
++    home_core_inner_ = lv_obj_create(home_core_outer_);
++    lv_obj_set_size(home_core_inner_, 96, 96);
++    lv_obj_center(home_core_inner_);
++    lv_obj_set_style_radius(home_core_inner_, 48, 0);
++    lv_obj_set_style_bg_color(home_core_inner_, lv_color_hex(kPanelRaised), 0);
++    lv_obj_set_style_border_color(home_core_inner_, lv_color_hex(kViolet), 0);
++    lv_obj_set_style_border_width(home_core_inner_, 1, 0);
++    lv_obj_set_style_pad_all(home_core_inner_, 0, 0);
++    lv_obj_remove_flag(home_core_inner_, LV_OBJ_FLAG_SCROLLABLE);
++
++    home_core_icon_ = MakeLabel(home_core_inner_, FONT_AWESOME_MICROCHIP_AI, 0, 26, 96, kCyan,
++                                &font_awesome_30_4, LV_TEXT_ALIGN_CENTER);
++
++    home_state_ = MakeLabel(home_root_, "正在启动", 214, 105, 238, kInk, &font_puhui_basic_30_4);
++    home_subtitle_ = MakeLabel(home_root_, "ML307 蜂窝网络 · 固定后台", 216, 151, 238, kMuted);
++    lv_label_set_long_mode(home_subtitle_, LV_LABEL_LONG_DOT);
++
++    auto* status_card = MakePanel(home_root_, 214, 186, 248, 48, kPanelSoft, 14);
++    home_network_ = MakeLabel(status_card, "", 14, 13, 48, kCyan, &font_awesome_20_4);
++    home_mute_ = MakeLabel(status_card, "", 86, 13, 48, kMuted, &font_awesome_20_4);
++    home_battery_ = MakeLabel(status_card, "", 176, 13, 52, kGreen, &font_awesome_20_4, LV_TEXT_ALIGN_RIGHT);
++
++    home_hint_ = MakeLabel(home_root_, "按 BOOT 开始/结束对话 · 摄像头与触摸保持原厂逻辑",
++                           18, 282, 444, kMuted, &BUILTIN_TEXT_FONT, LV_TEXT_ALIGN_CENTER);
++
++    // CHAT ------------------------------------------------------------------
++    chat_root_ = lv_obj_create(aurora_root_);
++    StyleRoot(chat_root_);
++
++    MakeLabel(chat_root_, "DIALOG", 18, 12, 120, kCyan);
++    auto* chat_title = MakeLabel(chat_root_, "小智对话", 128, 10, 170, kInk, &font_puhui_basic_30_4);
++    lv_obj_set_style_text_letter_space(chat_title, 1, 0);
++
++    chat_state_dot_ = lv_obj_create(chat_root_);
++    lv_obj_set_pos(chat_state_dot_, 334, 19);
++    lv_obj_set_size(chat_state_dot_, 10, 10);
++    lv_obj_set_style_radius(chat_state_dot_, 5, 0);
++    lv_obj_set_style_border_width(chat_state_dot_, 0, 0);
++    lv_obj_set_style_bg_color(chat_state_dot_, lv_color_hex(kCyan), 0);
++    lv_obj_remove_flag(chat_state_dot_, LV_OBJ_FLAG_SCROLLABLE);
++    chat_state_ = MakeLabel(chat_root_, "等待语音", 352, 12, 110, kMuted, &BUILTIN_TEXT_FONT, LV_TEXT_ALIGN_RIGHT);
++
++    auto* user_card = MakePanel(chat_root_, 14, 50, 452, 62, kPanelSoft, 16);
++    MakeLabel(user_card, "你", 14, 9, 32, kViolet);
++    chat_user_text_ = MakeLabel(user_card, "正在聆听…", 54, 9, 382, kInk);
++    lv_obj_set_height(chat_user_text_, 42);
++    lv_label_set_long_mode(chat_user_text_, LV_LABEL_LONG_WRAP);
++    lv_obj_set_style_text_line_space(chat_user_text_, 3, 0);
++
++    chat_answer_box_ = MakePanel(chat_root_, 14, 122, 452, 154, kPanel, 18);
++    lv_obj_set_style_clip_corner(chat_answer_box_, true, 0);
++    MakeLabel(chat_answer_box_, "AURORA", 14, 10, 90, kCyan);
++    chat_answer_ = MakeLabel(chat_answer_box_, "请说，我在听。", 14, 38, 424, kInk);
++    lv_label_set_long_mode(chat_answer_, LV_LABEL_LONG_WRAP);
++    lv_obj_set_style_text_line_space(chat_answer_, 6, 0);
++
++    chat_footer_ = MakeLabel(chat_root_, "回答较长时会自动缓慢滚动", 18, 289, 444, kMuted,
++                             &BUILTIN_TEXT_FONT, LV_TEXT_ALIGN_CENTER);
++
++    // CAMERA ----------------------------------------------------------------
++    camera_root_ = lv_obj_create(aurora_root_);
++    StyleRoot(camera_root_);
++    lv_obj_set_style_bg_color(camera_root_, lv_color_black(), 0);
++    lv_obj_set_style_bg_grad_color(camera_root_, lv_color_hex(0x07111F), 0);
++    MakeLabel(camera_root_, "CAMERA  /  原厂取景", 16, 10, 260, kCyan);
++    camera_status_ = MakeLabel(camera_root_, "图像预览", 300, 10, 164, kMuted,
++                               &BUILTIN_TEXT_FONT, LV_TEXT_ALIGN_RIGHT);
++    camera_image_ = lv_image_create(camera_root_);
++    lv_obj_align(camera_image_, LV_ALIGN_CENTER, 0, 8);
++    lv_obj_add_flag(camera_image_, LV_OBJ_FLAG_HIDDEN);
++
++    // Notification overlay ---------------------------------------------------
++    notification_panel_ = MakePanel(aurora_root_, 42, 246, 396, 54, 0x1A2C42, 16);
++    lv_obj_set_style_border_color(notification_panel_, lv_color_hex(kCyan), 0);
++    lv_obj_set_style_shadow_color(notification_panel_, lv_color_hex(kCyan), 0);
++    lv_obj_set_style_shadow_width(notification_panel_, 14, 0);
++    lv_obj_set_style_shadow_opa(notification_panel_, LV_OPA_20, 0);
++    notification_text_ = MakeLabel(notification_panel_, "", 12, 15, 372, kInk,
++                                   &BUILTIN_TEXT_FONT, LV_TEXT_ALIGN_CENTER);
++    lv_label_set_long_mode(notification_text_, LV_LABEL_LONG_DOT);
++    lv_obj_add_flag(notification_panel_, LV_OBJ_FLAG_HIDDEN);
++
++    last_state_ = Application::GetInstance().GetDeviceState();
++    ShowPageInternal(Page::Home);
++    UpdateHomeClockInternal();
++    UpdateHomeStateInternal(last_state_);
++}
++
++void AuroraMax35Display::ShowPageInternal(Page page) {
++    if (!home_root_ || !chat_root_ || !camera_root_) return;
++    lv_obj_add_flag(home_root_, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_add_flag(chat_root_, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_add_flag(camera_root_, LV_OBJ_FLAG_HIDDEN);
++
++    lv_obj_t* target = nullptr;
++    if (page == Page::Home) target = home_root_;
++    if (page == Page::Chat) target = chat_root_;
++    if (page == Page::Camera) target = camera_root_;
++    if (target) {
++        lv_obj_remove_flag(target, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_move_foreground(target);
++    }
++    if (notification_panel_ && !lv_obj_has_flag(notification_panel_, LV_OBJ_FLAG_HIDDEN)) {
++        lv_obj_move_foreground(notification_panel_);
++    }
++    page_ = page;
++}
++
++bool AuroraMax35Display::LooksLikeClock(const char* text) {
++    return text && std::strlen(text) == 5 && std::isdigit(static_cast<unsigned char>(text[0])) &&
++           std::isdigit(static_cast<unsigned char>(text[1])) && text[2] == ':' &&
++           std::isdigit(static_cast<unsigned char>(text[3])) && std::isdigit(static_cast<unsigned char>(text[4]));
++}
++
++bool AuroraMax35Display::IsConversing(DeviceState state) {
++    return state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking;
++}
++
++const char* AuroraMax35Display::StateText(DeviceState state) {
++    switch (state) {
++        case kDeviceStateStarting: return "正在启动";
++        case kDeviceStateWifiConfiguring: return "等待网络";
++        case kDeviceStateIdle: return "待命";
++        case kDeviceStateConnecting: return "连接 AI";
++        case kDeviceStateListening: return "聆听中";
++        case kDeviceStateSpeaking: return "回答中";
++        case kDeviceStateUpgrading: return "升级中";
++        case kDeviceStateActivating: return "激活中";
++        case kDeviceStateAudioTesting: return "音频测试";
++        case kDeviceStateFatalError: return "系统异常";
++        default: return "准备中";
++    }
++}
++
++uint32_t AuroraMax35Display::StateColor(DeviceState state) {
++    switch (state) {
++        case kDeviceStateListening: return kCyan;
++        case kDeviceStateSpeaking: return kGold;
++        case kDeviceStateConnecting:
++        case kDeviceStateActivating: return kViolet;
++        case kDeviceStateFatalError: return kRed;
++        case kDeviceStateUpgrading: return kGold;
++        default: return kGreen;
++    }
++}
++
++const char* AuroraMax35Display::WeekdayText(int weekday) {
++    static const char* kWeekdays[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
++    return (weekday >= 0 && weekday < 7) ? kWeekdays[weekday] : "";
++}
++
++void AuroraMax35Display::UpdateHomeClockInternal() {
++    if (!home_clock_ || !home_date_) return;
++    std::time_t now = std::time(nullptr);
++    std::tm tm{};
++    localtime_r(&now, &tm);
++    if (tm.tm_year < 2025 - 1900) {
++        lv_label_set_text(home_clock_, "--:--");
++        lv_label_set_text(home_date_, "时间同步中");
++        return;
++    }
++    char time_buf[16];
++    char date_buf[48];
++    std::snprintf(time_buf, sizeof(time_buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
++    std::snprintf(date_buf, sizeof(date_buf), "%d月%d日 · %s", tm.tm_mon + 1, tm.tm_mday, WeekdayText(tm.tm_wday));
++    lv_label_set_text(home_clock_, time_buf);
++    lv_label_set_text(home_date_, date_buf);
++}
++
++void AuroraMax35Display::UpdateHomeStateInternal(DeviceState state) {
++    if (!home_state_ || !home_subtitle_ || !home_core_outer_ || !home_core_icon_) return;
++    const uint32_t color = StateColor(state);
++    lv_label_set_text(home_state_, StateText(state));
++    lv_obj_set_style_text_color(home_state_, lv_color_hex(color), 0);
++    lv_obj_set_style_border_color(home_core_outer_, lv_color_hex(color), 0);
++    lv_obj_set_style_shadow_color(home_core_outer_, lv_color_hex(color), 0);
++    lv_obj_set_style_text_color(home_core_icon_, lv_color_hex(color), 0);
++
++    if (!last_system_message_.empty() && state != kDeviceStateIdle) {
++        lv_label_set_text(home_subtitle_, last_system_message_.c_str());
++    } else if (state == kDeviceStateIdle) {
++        lv_label_set_text(home_subtitle_, "ML307 蜂窝网络 · AURORA 已就绪");
++    } else {
++        lv_label_set_text(home_subtitle_, last_status_.empty() ? "ML307 蜂窝网络" : last_status_.c_str());
++    }
++}
++
++void AuroraMax35Display::UpdateChatStateInternal(DeviceState state) {
++    if (!chat_state_ || !chat_state_dot_) return;
++    const uint32_t color = StateColor(state);
++    const char* text = StateText(state);
++    if (waiting_for_answer_ && state == kDeviceStateListening) {
++        text = "思考中";
++    } else if (state == kDeviceStateListening && user_text_.empty()) {
++        text = "正在聆听";
++    }
++    lv_label_set_text(chat_state_, text);
++    lv_obj_set_style_text_color(chat_state_, lv_color_hex(color), 0);
++    lv_obj_set_style_bg_color(chat_state_dot_, lv_color_hex(color), 0);
++}
++
++void AuroraMax35Display::ResetConversationInternal() {
++    user_text_.clear();
++    assistant_text_.clear();
++    last_assistant_fragment_.clear();
++    waiting_for_answer_ = false;
++    scroll_pending_ = false;
++    scroll_due_us_ = 0;
++    scroll_finish_us_ = 0;
++    return_home_us_ = 0;
++    StopReadableScrollInternal();
++    if (chat_user_text_) lv_label_set_text(chat_user_text_, "正在聆听…");
++    if (chat_answer_) lv_label_set_text(chat_answer_, "请说，我在听。");
++    if (chat_footer_) lv_label_set_text(chat_footer_, "回答较长时会自动缓慢滚动");
++}
++
++void AuroraMax35Display::SetAssistantTextInternal(const std::string& text) {
++    if (!chat_answer_) return;
++    StopReadableScrollInternal();
++    lv_label_set_text(chat_answer_, text.c_str());
++    lv_obj_set_y(chat_answer_, 38);
++}
++
++void AuroraMax35Display::StopReadableScrollInternal() {
++    if (!chat_answer_) return;
++    lv_anim_delete(chat_answer_, nullptr);
++    lv_obj_set_y(chat_answer_, 38);
++}
++
++int64_t AuroraMax35Display::StartReadableScrollInternal(int delay_ms, int ms_per_pixel) {
++    if (!chat_answer_ || !chat_answer_box_) return 0;
++    StopReadableScrollInternal();
++    lv_obj_update_layout(chat_answer_);
++    const int visible = lv_obj_get_height(chat_answer_box_) - 52;
++    const int height = lv_obj_get_height(chat_answer_);
++    if (height <= visible) {
++        scroll_finish_us_ = 0;
++        if (chat_footer_) lv_label_set_text(chat_footer_, "完整回答已显示");
++        return 0;
++    }
++
++    const int distance = height - visible;
++    const int duration = std::max(2600, distance * ms_per_pixel);
++    lv_anim_t anim;
++    lv_anim_init(&anim);
++    lv_anim_set_var(&anim, chat_answer_);
++    lv_anim_set_values(&anim, 38, 38 - distance);
++    lv_anim_set_delay(&anim, delay_ms);
++    lv_anim_set_duration(&anim, duration);
++    lv_anim_set_path_cb(&anim, lv_anim_path_linear);
++    lv_anim_set_exec_cb(&anim, [](void* obj, int32_t value) {
++        lv_obj_set_y(static_cast<lv_obj_t*>(obj), value);
++    });
++    lv_anim_start(&anim);
++    if (chat_footer_) lv_label_set_text(chat_footer_, "长回答 · 正在缓慢滚动阅读");
++    scroll_finish_us_ = esp_timer_get_time() + static_cast<int64_t>(delay_ms + duration) * 1000LL;
++    return scroll_finish_us_;
++}
++
++void AuroraMax35Display::ScheduleReadableScrollInternal() {
++    scroll_pending_ = true;
++    scroll_due_us_ = esp_timer_get_time() + kScrollDebounceUs;
++    scroll_finish_us_ = 0;
++}
++
++void AuroraMax35Display::SetStatus(const char* status) {
++    if (!status) return;
++    DisplayLockGuard lock(this);
++    if (LooksLikeClock(status)) {
++        if (home_clock_) lv_label_set_text(home_clock_, status);
++        return;
++    }
++
++    last_status_ = status;
++    const DeviceState state = Application::GetInstance().GetDeviceState();
++    UpdateHomeStateInternal(state);
++
++    if (state == kDeviceStateListening) {
++        if (page_ == Page::Home) {
++            ResetConversationInternal();
++            conversation_active_ = true;
++            ShowPageInternal(Page::Chat);
++        }
++        return_home_us_ = 0;
++        UpdateChatStateInternal(state);
++    } else if (state == kDeviceStateConnecting || state == kDeviceStateSpeaking) {
++        if (conversation_active_ && page_ != Page::Camera) ShowPageInternal(Page::Chat);
++        return_home_us_ = 0;
++        UpdateChatStateInternal(state);
++    } else if (state == kDeviceStateFatalError || state == kDeviceStateUpgrading || state == kDeviceStateActivating) {
++        if (!conversation_active_ && page_ != Page::Camera) ShowPageInternal(Page::Home);
++    }
++}
++
++void AuroraMax35Display::NotificationTimerCallback(void* arg) {
++    auto* self = static_cast<AuroraMax35Display*>(arg);
++    if (!self) return;
++    DisplayLockGuard lock(self);
++    self->SetNotificationVisibleInternal(false);
++}
++
++void AuroraMax35Display::SetNotificationVisibleInternal(bool visible) {
++    if (!notification_panel_) return;
++    if (visible) {
++        lv_obj_remove_flag(notification_panel_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_move_foreground(notification_panel_);
++    } else {
++        lv_obj_add_flag(notification_panel_, LV_OBJ_FLAG_HIDDEN);
++    }
++}
++
++void AuroraMax35Display::ShowNotification(const char* notification, int duration_ms) {
++    if (!notification || !notification_text_) return;
++    DisplayLockGuard lock(this);
++    lv_label_set_text(notification_text_, notification);
++    SetNotificationVisibleInternal(true);
++    if (aurora_notification_timer_) {
++        esp_timer_stop(aurora_notification_timer_);
++        ESP_ERROR_CHECK(esp_timer_start_once(aurora_notification_timer_, static_cast<uint64_t>(std::max(duration_ms, 500)) * 1000ULL));
++    }
++}
++
++void AuroraMax35Display::SetEmotion(const char* emotion) {
++    if (!emotion || !home_core_icon_) return;
++    const char* glyph = font_awesome_get_utf8(emotion);
++    if (!glyph) glyph = FONT_AWESOME_MICROCHIP_AI;
++    DisplayLockGuard lock(this);
++    lv_label_set_text(home_core_icon_, glyph);
++}
++
++void AuroraMax35Display::SetChatMessage(const char* role, const char* content) {
++    if (!role || !content) return;
++    DisplayLockGuard lock(this);
++
++    if (std::strcmp(role, "system") == 0) {
++        if (content[0]) {
++            const DeviceState state = Application::GetInstance().GetDeviceState();
++            // Application prints the User-Agent into the display at boot. Keep that diagnostic
++            // out of the product UI, but preserve later system/error messages.
++            if (!(state == kDeviceStateStarting && std::strchr(content, '/') != nullptr)) {
++                last_system_message_ = content;
++                if (!conversation_active_ && page_ == Page::Home) {
++                    lv_label_set_text(home_subtitle_, content);
++                }
++            }
++        }
++        return;
++    }
++
++    if (!content[0]) return;
++
++    if (page_ == Page::Camera) {
++        esp_timer_stop(preview_timer_);
++        aurora_preview_cache_.reset();
++        if (camera_image_) lv_obj_add_flag(camera_image_, LV_OBJ_FLAG_HIDDEN);
++    }
++
++    if (std::strcmp(role, "user") == 0) {
++        conversation_active_ = true;
++        waiting_for_answer_ = true;
++        return_home_us_ = 0;
++        user_text_ = content;
++        assistant_text_.clear();
++        last_assistant_fragment_.clear();
++        scroll_pending_ = false;
++        scroll_due_us_ = 0;
++        scroll_finish_us_ = 0;
++        StopReadableScrollInternal();
++        ShowPageInternal(Page::Chat);
++        lv_label_set_text(chat_user_text_, user_text_.c_str());
++        lv_label_set_text(chat_answer_, "我听到了，正在整理回答…");
++        lv_obj_set_y(chat_answer_, 38);
++        lv_label_set_text(chat_footer_, "正在思考");
++        UpdateChatStateInternal(Application::GetInstance().GetDeviceState());
++        return;
++    }
++
++    if (std::strcmp(role, "assistant") == 0) {
++        conversation_active_ = true;
++        waiting_for_answer_ = false;
++        return_home_us_ = 0;
++        ShowPageInternal(Page::Chat);
++
++        std::string fragment(content);
++        if (fragment == last_assistant_fragment_) {
++            return;
++        }
++        last_assistant_fragment_ = fragment;
++
++        // Support both server styles: cumulative text and sentence-by-sentence text.
++        if (assistant_text_.empty()) {
++            assistant_text_ = fragment;
++        } else if (fragment.rfind(assistant_text_, 0) == 0) {
++            assistant_text_ = fragment;
++        } else if (assistant_text_.size() >= fragment.size() &&
++                   assistant_text_.compare(assistant_text_.size() - fragment.size(), fragment.size(), fragment) == 0) {
++            // Duplicate suffix; keep existing text.
++        } else {
++            if (EndsWithAsciiWordChar(assistant_text_) && StartsWithAsciiWordChar(fragment.c_str())) {
++                assistant_text_ += ' ';
++            } else {
++                assistant_text_ += '\n';
++            }
++            assistant_text_ += fragment;
++        }
++
++        SetAssistantTextInternal(assistant_text_);
++        ScheduleReadableScrollInternal();
++        lv_label_set_text(chat_footer_, "回答会完整保留；超出一屏后自动滚动");
++        UpdateChatStateInternal(Application::GetInstance().GetDeviceState());
++    }
++}
++
++void AuroraMax35Display::SetPreviewImage(std::unique_ptr<LvglImage> image) {
++    DisplayLockGuard lock(this);
++    if (!camera_root_ || !camera_image_) return;
++
++    if (!image) {
++        FinishCameraPreviewInternal();
++        return;
++    }
++
++    page_before_camera_ = (page_ == Page::Camera) ? page_before_camera_ : page_;
++    aurora_preview_cache_ = std::move(image);
++    auto* dsc = aurora_preview_cache_->image_dsc();
++    if (!dsc || dsc->header.w == 0 || dsc->header.h == 0) {
++        ESP_LOGW(TAG, "Camera preview image has invalid dimensions");
++        aurora_preview_cache_.reset();
++        return;
++    }
++
++    lv_image_set_src(camera_image_, dsc);
++    const int max_w = 456;
++    const int max_h = 252;
++    const int zoom_w = max_w * 256 / static_cast<int>(dsc->header.w);
++    const int zoom_h = max_h * 256 / static_cast<int>(dsc->header.h);
++    int zoom = std::min(zoom_w, zoom_h);
++    if (zoom > 256) zoom = 256;
++    if (zoom < 1) zoom = 1;
++    lv_image_set_scale(camera_image_, zoom);
++    lv_obj_remove_flag(camera_image_, LV_OBJ_FLAG_HIDDEN);
++    lv_label_set_text(camera_status_, "原厂 Camera::Capture() 预览");
++    ShowPageInternal(Page::Camera);
++
++    esp_timer_stop(preview_timer_);
++    ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000ULL));
++}
++
++void AuroraMax35Display::FinishCameraPreviewInternal() {
++    esp_timer_stop(preview_timer_);
++    if (camera_image_) lv_obj_add_flag(camera_image_, LV_OBJ_FLAG_HIDDEN);
++    aurora_preview_cache_.reset();
++    Page target = page_before_camera_;
++    if (conversation_active_) target = Page::Chat;
++    ShowPageInternal(target);
++}
++
++void AuroraMax35Display::CopyFactoryStatusIconsInternal() {
++    if (home_network_ && network_label_) {
++        const char* text = lv_label_get_text(network_label_);
++        lv_label_set_text(home_network_, text ? text : "");
++    }
++    if (home_battery_ && battery_label_) {
++        const char* text = lv_label_get_text(battery_label_);
++        lv_label_set_text(home_battery_, text ? text : "");
++    }
++    if (home_mute_ && mute_label_) {
++        const char* text = lv_label_get_text(mute_label_);
++        lv_label_set_text(home_mute_, text ? text : "");
++    }
++}
++
++void AuroraMax35Display::UpdateStatusBar(bool update_all) {
++    // Keep the factory battery/network acquisition path intact. The original labels are hidden;
++    // AURORA only mirrors their glyphs into the new home page.
++    LvglDisplay::UpdateStatusBar(update_all);
++
++    const DeviceState state = Application::GetInstance().GetDeviceState();
++    const int64_t now = esp_timer_get_time();
++
++    DisplayLockGuard lock(this);
++    CopyFactoryStatusIconsInternal();
++    UpdateHomeClockInternal();
++
++    if (state != last_state_) {
++        if (state == kDeviceStateListening && page_ == Page::Home) {
++            ResetConversationInternal();
++            conversation_active_ = true;
++            ShowPageInternal(Page::Chat);
++        }
++        if (IsConversing(state)) return_home_us_ = 0;
++        UpdateHomeStateInternal(state);
++        UpdateChatStateInternal(state);
++        last_state_ = state;
++    } else if (page_ == Page::Home) {
++        UpdateHomeStateInternal(state);
++    }
++
++    if (page_ == Page::Chat && scroll_pending_ && now >= scroll_due_us_) {
++        scroll_pending_ = false;
++        scroll_due_us_ = 0;
++        StartReadableScrollInternal();
++    }
++
++    if (page_ == Page::Chat && conversation_active_) {
++        if (state == kDeviceStateIdle) {
++            if (scroll_pending_) {
++                return_home_us_ = 0;
++            } else if (scroll_finish_us_ > now) {
++                return_home_us_ = scroll_finish_us_ + kAfterScrollDelayUs;
++            } else if (return_home_us_ == 0) {
++                return_home_us_ = now + kReturnHomeDelayUs;
++            }
++        } else if (IsConversing(state)) {
++            return_home_us_ = 0;
++        }
++
++        if (return_home_us_ > 0 && now >= return_home_us_) {
++            conversation_active_ = false;
++            waiting_for_answer_ = false;
++            return_home_us_ = 0;
++            scroll_finish_us_ = 0;
++            scroll_pending_ = false;
++            ShowPageInternal(Page::Home);
++            UpdateHomeStateInternal(state);
++        }
++    }
++}
+--- a/main/boards/sp-esp32-s3-lcd-3.5-cam-ml307/aurora_max35_display.h
++++ b/main/boards/sp-esp32-s3-lcd-3.5-cam-ml307/aurora_max35_display.h
+@@ -0,0 +1,101 @@
++#pragma once
++
++#include "display/lcd_display.h"
++#include "device_state.h"
++
++#include <esp_timer.h>
++#include <memory>
++#include <string>
++
++class AuroraMax35Display : public SpiLcdDisplay {
++public:
++    AuroraMax35Display(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
++                       int width, int height, int offset_x, int offset_y,
++                       bool mirror_x, bool mirror_y, bool swap_xy);
++    ~AuroraMax35Display() override;
++
++    void SetStatus(const char* status) override;
++    void ShowNotification(const char* notification, int duration_ms = 3000) override;
++    void SetEmotion(const char* emotion) override;
++    void SetChatMessage(const char* role, const char* content) override;
++    void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
++    void UpdateStatusBar(bool update_all = false) override;
++
++private:
++    enum class Page {
++        Home,
++        Chat,
++        Camera,
++    };
++
++    void BuildAuroraUi();
++    void HideFactoryUi();
++    void ShowPageInternal(Page page);
++    void UpdateHomeClockInternal();
++    void UpdateHomeStateInternal(DeviceState state);
++    void UpdateChatStateInternal(DeviceState state);
++    void ResetConversationInternal();
++    void SetAssistantTextInternal(const std::string& text);
++    void StopReadableScrollInternal();
++    int64_t StartReadableScrollInternal(int delay_ms = 1700, int ms_per_pixel = 82);
++    void ScheduleReadableScrollInternal();
++    void FinishCameraPreviewInternal();
++    void CopyFactoryStatusIconsInternal();
++    void SetNotificationVisibleInternal(bool visible);
++
++    static bool LooksLikeClock(const char* text);
++    static bool IsConversing(DeviceState state);
++    static const char* StateText(DeviceState state);
++    static uint32_t StateColor(DeviceState state);
++    static const char* WeekdayText(int weekday);
++    static void NotificationTimerCallback(void* arg);
++
++    Page page_ = Page::Home;
++    Page page_before_camera_ = Page::Home;
++    DeviceState last_state_ = kDeviceStateUnknown;
++
++    lv_obj_t* aurora_root_ = nullptr;
++    lv_obj_t* home_root_ = nullptr;
++    lv_obj_t* home_brand_ = nullptr;
++    lv_obj_t* home_clock_ = nullptr;
++    lv_obj_t* home_date_ = nullptr;
++    lv_obj_t* home_core_outer_ = nullptr;
++    lv_obj_t* home_core_inner_ = nullptr;
++    lv_obj_t* home_core_icon_ = nullptr;
++    lv_obj_t* home_state_ = nullptr;
++    lv_obj_t* home_subtitle_ = nullptr;
++    lv_obj_t* home_network_ = nullptr;
++    lv_obj_t* home_battery_ = nullptr;
++    lv_obj_t* home_mute_ = nullptr;
++    lv_obj_t* home_hint_ = nullptr;
++
++    lv_obj_t* chat_root_ = nullptr;
++    lv_obj_t* chat_state_dot_ = nullptr;
++    lv_obj_t* chat_state_ = nullptr;
++    lv_obj_t* chat_user_text_ = nullptr;
++    lv_obj_t* chat_answer_box_ = nullptr;
++    lv_obj_t* chat_answer_ = nullptr;
++    lv_obj_t* chat_footer_ = nullptr;
++
++    lv_obj_t* camera_root_ = nullptr;
++    lv_obj_t* camera_image_ = nullptr;
++    lv_obj_t* camera_status_ = nullptr;
++    std::unique_ptr<LvglImage> aurora_preview_cache_;
++
++    lv_obj_t* notification_panel_ = nullptr;
++    lv_obj_t* notification_text_ = nullptr;
++    esp_timer_handle_t aurora_notification_timer_ = nullptr;
++
++    std::string last_status_;
++    std::string last_system_message_;
++    std::string user_text_;
++    std::string assistant_text_;
++    std::string last_assistant_fragment_;
++
++    bool conversation_active_ = false;
++    bool waiting_for_answer_ = false;
++    bool scroll_pending_ = false;
++    int64_t scroll_due_us_ = 0;
++    int64_t scroll_finish_us_ = 0;
++    int64_t return_home_us_ = 0;
++};
+--- a/main/boards/sp-esp32-s3-lcd-3.5-cam-ml307/config.json
++++ b/main/boards/sp-esp32-s3-lcd-3.5-cam-ml307/config.json
+@@ -4,6 +4,7 @@
+         {
+             "name": "sp-esp32-s3-lcd-3.5-cam-ml307",
+             "sdkconfig_append": [
++                "CONFIG_OTA_URL=\"http://124.221.112.55:8002/xiaozhi/ota/\"",
+                 "CONFIG_USE_WECHAT_MESSAGE_STYLE=y",
+                 "CONFIG_CAMERA_OV2640=y",
+                 "CONFIG_CAMERA_OV2640_AUTO_DETECT_DVP_INTERFACE_SENSOR=y",
+@@ -16,4 +17,4 @@
+             ]
+         }
+     ]
+-}+}
+--- a/main/boards/sp-esp32-s3-lcd-3.5-cam-ml307/sp-esp32-s3-lcd-3.5-cam-ml307.cc
++++ b/main/boards/sp-esp32-s3-lcd-3.5-cam-ml307/sp-esp32-s3-lcd-3.5-cam-ml307.cc
+@@ -1,7 +1,7 @@
+ #include "ml307_board.h"
+ // #include "codecs/es8311_audio_codec.h"
+ #include "codecs/box_audio_codec.h"
+-#include "display/lcd_display.h"
++#include "aurora_max35_display.h"
+ #include "system_reset.h"
+ #include "application.h"
+ #include "button.h"
+@@ -352,7 +352,7 @@
+         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
+         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+ 
+-        display_ = new SpiLcdDisplay(panel_io, panel,
++        display_ = new AuroraMax35Display(panel_io, panel,
+                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+     }
+ 
+--- a/main/ota.cc
++++ b/main/ota.cc
+@@ -41,12 +41,10 @@
+ }
+ 
+ std::string Ota::GetCheckVersionUrl() {
+-    Settings settings("wifi", false);
+-    std::string url = settings.GetString("ota_url");
+-    if (url.empty()) {
+-        url = CONFIG_OTA_URL;
+-    }
+-    return url;
++    // MAX35 4G has no Wi-Fi provisioning page for selecting a backend.
++    // Keep this product build pinned to the compile-time OTA discovery URL
++    // so stale NVS data can never redirect it to another Xiaozhi backend.
++    return CONFIG_OTA_URL;
+ }
+ 
+ std::unique_ptr<Http> Ota::SetupHttp() {
