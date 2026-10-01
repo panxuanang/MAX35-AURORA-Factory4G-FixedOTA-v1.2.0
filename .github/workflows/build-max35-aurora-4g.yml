@@ -1,0 +1,95 @@
+name: Build MAX35 AURORA 4G - Factory Base
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: MAX35 4G ML307 + AURORA
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: espressif/idf:release-v5.5
+
+    steps:
+      - name: Checkout build package
+        uses: actions/checkout@v7
+
+      - name: Verify bundled factory source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c SOURCE_SHA256.txt
+          sha256sum -c FACTORY_RECOVERY_SHA256.txt
+
+      - name: Restore exact patched factory source
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf source/factory-aurora-source.tar.gz
+          test -f xiaozhi-esp32/dependencies.lock
+          test -f xiaozhi-esp32/main/boards/sp-esp32-s3-lcd-3.5-cam-ml307/sp-esp32-s3-lcd-3.5-cam-ml307.cc
+
+      - name: Preflight - factory hardware must remain untouched
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/verify_source.py xiaozhi-esp32
+
+      - name: Build exact SpotPear MAX35 4G ML307 target
+        shell: bash
+        working-directory: xiaozhi-esp32
+        env:
+          IDF_COMPONENT_MANAGER: "1"
+        run: |
+          set -euo pipefail
+          source "$IDF_PATH/export.sh"
+          rm -rf build sdkconfig sdkconfig.old managed_components releases/v2.1.0_sp-esp32-s3-lcd-3.5-cam-ml307
+          echo '[build] ESP-IDF will restore the exact component versions pinned by dependencies.lock'
+          python scripts/release.py sp-esp32-s3-lcd-3.5-cam-ml307 --name sp-esp32-s3-lcd-3.5-cam-ml307
+
+      - name: Verify final firmware configuration
+        shell: bash
+        working-directory: xiaozhi-esp32
+        run: |
+          set -euo pipefail
+          grep -Fqx 'CONFIG_IDF_TARGET_ESP32S3=y' sdkconfig
+          grep -Fqx 'CONFIG_BOARD_TYPE_SPOTPEAR_ESP32_S3_3_5_LCD_CAM_ML307=y' sdkconfig
+          grep -Fqx 'CONFIG_USE_WECHAT_MESSAGE_STYLE=y' sdkconfig
+          grep -Fqx 'CONFIG_OTA_URL="http://124.221.112.55:8002/xiaozhi/ota/"' sdkconfig
+          test -s build/merged-binary.bin
+          echo '[OK] exact MAX35 ML307 target + fixed OTA verified'
+
+      - name: Package firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp xiaozhi-esp32/build/merged-binary.bin dist/MAX35_AURORA_FACTORY4G_v1.2.0_merged-binary.bin
+          cp xiaozhi-esp32/releases/v2.1.0_sp-esp32-s3-lcd-3.5-cam-ml307.zip dist/factory-build-package.zip
+          cp factory-recovery/ESP32S3-MAX35-4G-LCD-BCamera-Case.bin dist/FACTORY_RECOVERY_ESP32S3-MAX35-4G-LCD-BCamera-Case.bin
+          cat > dist/BUILD_INFO.txt <<'EOF'
+          product=SpotPear ESP32S3-MAX35 4G ML307 rear-camera touch version
+          factory_project_version=2.1.0
+          aurora_package_version=1.2.0
+          esp_idf=release-v5.5
+          board=sp-esp32-s3-lcd-3.5-cam-ml307
+          ota_url=http://124.221.112.55:8002/xiaozhi/ota/
+          ota_url_policy=fixed-in-firmware-nvs-override-disabled
+          ui=AURORA home + auto dialog page + full answer accumulation + slow readable scroll
+          flash_merged_binary_at=0x0
+          EOF
+          (cd dist && sha256sum *.bin *.zip > SHA256SUMS.txt)
+          cat dist/BUILD_INFO.txt
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: MAX35-AURORA-Factory4G-Firmware
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
